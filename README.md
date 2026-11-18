@@ -15,8 +15,8 @@ three algorithms (3 × 3 = 9 partitions).
 
 | method | distance |
 |---|---|
-| `mash` | Mash distance (k = 31, sketch size 10,000, `-m 2`: k-mers seen once are ignored) |
-| `sourmash` | 1 − Jaccard similarity (k = 31, scaled = 1,000, no low-abundance filtering) |
+| `mash` | Mash distance (k = 31, sketch size 10,000) |
+| `sourmash` | 1 − Jaccard similarity (k = 31, scaled = 1,000) |
 | `sourmash_abundance` | 1 − angular similarity of abundance-tracking sketches (k = 31, scaled = 1,000) |
 
 | algorithm | how the number of clusters is chosen |
