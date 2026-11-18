@@ -23,7 +23,7 @@ three algorithms (3 × 3 = 9 partitions).
 |---|---|
 | `KM` | k-medoids (PAM, BUILD initialisation, scikit-learn-extra). Elbow rule on the sum of distances to the nearest medoid. |
 | `FKM` | Fuzzy k-medoids (FCMdd, m = 2, BUILD initialisation). Elbow rule on the fuzzy objective Σᵢ Σⱼ uᵢⱼ² d(i, medoid j); each sample is assigned to the cluster with its highest membership. |
-| `DBSCAN` | DBSCAN with `min_samples = 1` (equivalent to a single-linkage cut at eps). eps is the value with the highest silhouette score (precomputed distances) on a grid of 1,000 values from 10⁻⁶ to 1. If no eps gives a valid partition, eps = 0.9 when the standard deviation of the distances is < 0.3, otherwise 0.1. |
+| `DBSCAN` | DBSCAN with `min_samples = 1` (equivalent to a single-linkage cut at eps). eps is the value with the highest silhouette score (precomputed distances) on a grid of 1,000 values from 10⁻⁶ to 1.|
 
 **Elbow rule:** k is scanned from 2 to n − 1 (n = number of samples); the chosen
 k is the point of the objective curve farthest from the straight line between the
