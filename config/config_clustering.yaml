@@ -1,0 +1,25 @@
+# Sample sheet: tab-separated, columns sample / read (r1 or r2) / path to trimmed reads
+samples: config/samples_example.tsv
+
+outdir: results
+logdir: logs
+benchmarkdir: benchmarks
+
+# Distances and clustering algorithms to run (default: all 3 x 3)
+methods: [mash, sourmash, sourmash_abundance]
+algorithms: [KM, FKM, DBSCAN]
+
+# Sketch settings (values used in the manuscript)
+sketch:
+  mash_k: 31
+  mash_sketch_size: 10000
+  mash_min_copies: 2        # mash -m: ignore k-mers seen only once
+  sourmash_k: 31
+  sourmash_scaled: 1000
+
+threads:
+  distance: 8               # mash dist -p / sourmash compare -p
+  cluster: 1
+
+# Folder containing fuzzy_k_medoids_algorithm.py (separate repository)
+fkm_module_dir: external/fuzzy_k_medoids

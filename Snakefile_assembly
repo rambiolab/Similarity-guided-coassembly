@@ -1,0 +1,377 @@
+# =============================================================================
+# Co-assembly of one sample partition
+#
+# Input: one partition from the clustering workflow
+#        (results/{method}/{algorithm}_clusters.tsv: columns sample, cluster)
+#
+# Per cluster:  MEGAHIT co-assembly of all member samples
+#               -> BWA-MEM mapping of every member sample to the co-assembly
+#               -> MetaBAT2 binning (coverage across member samples)
+#               -> CheckM2 quality of the bins
+# Partition:    dRep dereplication of all bins (>= 50% completeness,
+#               <= 10% contamination, 95% ANI = species)
+#               -> GTDB-Tk classification of the dereplicated genomes
+#               -> summary tables
+#
+# Run:  snakemake -s Snakefile_assembly --configfile config/config_assembly.yaml \
+#           --use-conda --cores 64
+# =============================================================================
+
+import os
+
+
+configfile: "config/config_assembly.yaml"
+
+
+include: "rules/common.smk"
+
+
+OUTDIR = config["outdir"].rstrip("/")
+LOGDIR = f"{OUTDIR}/logs"
+BENCHDIR = f"{OUTDIR}/benchmarks"
+
+THREADS = config.get("threads", {})
+MEM = config.get("mem_mb", {})
+DREP = config.get("drep", {})
+
+SAMPLES = read_sample_sheet(config["samples"])
+CLUSTERS = read_partition(config["partition"], SAMPLES,
+                          prefix=config.get("cluster_prefix", "cluster_"))
+CLUSTER_NAMES = list(CLUSTERS)
+
+wildcard_constraints:
+    cluster="[^/]+",
+    sample="[^/]+",
+
+
+def member_reads(cluster, read):
+    return [SAMPLES[s][read] for s in CLUSTERS[cluster]]
+
+
+# -----------------------------------------------------------------------------
+# Final targets
+# -----------------------------------------------------------------------------
+
+rule all:
+    input:
+        f"{OUTDIR}/final/genomes.tsv",
+        f"{OUTDIR}/final/summary.tsv",
+
+
+# -----------------------------------------------------------------------------
+# Co-assembly
+# -----------------------------------------------------------------------------
+
+# MEGAHIT gets the member samples' read files as comma-separated lists.
+# If a run was interrupted, rerunning resumes it with --continue; the time log
+# is appended (-a), so the CPU time of both attempts is kept.
+rule megahit:
+    input:
+        r1=lambda wc: member_reads(wc.cluster, "r1"),
+        r2=lambda wc: member_reads(wc.cluster, "r2"),
+    output:
+        contigs=f"{OUTDIR}/assembly/{{cluster}}/final.contigs.fa",
+    params:
+        r1=lambda wc, input: ",".join(input.r1),
+        r2=lambda wc, input: ",".join(input.r2),
+        workdir=lambda wc: f"{OUTDIR}/assembly/{wc.cluster}/megahit",
+        # MEGAHIT --memory in bytes: a cap, not a reservation
+        memory=lambda wc, resources: int(resources.mem_mb * 1024 * 1024
+                                         * config.get("megahit_memory_fraction", 0.9)),
+        extra=config.get("megahit_extra", ""),
+    log:
+        out=f"{LOGDIR}/megahit/{{cluster}}.log",
+        time=f"{LOGDIR}/megahit/{{cluster}}.time.log",
+    benchmark:
+        f"{BENCHDIR}/megahit/{{cluster}}.benchmark.txt"
+    threads: THREADS.get("megahit", 32)
+    resources:
+        mem_mb=MEM.get("megahit", 600000),
+    conda:
+        "envs/megahit.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            echo "[START] $(date)"
+            if [ -d {params.workdir} ]; then
+                echo "[INFO] Resuming the existing MEGAHIT run"
+                CONTINUE="--continue"
+            else
+                CONTINUE=""
+            fi
+            /usr/bin/time -a -v -o {log.time} megahit \
+                -1 {params.r1} -2 {params.r2} \
+                -o {params.workdir} -t {threads} --memory {params.memory} \
+                $CONTINUE {params.extra}
+            cp {params.workdir}/final.contigs.fa {output.contigs}
+            rm -rf {params.workdir}/intermediate_contigs
+            echo "[END] $(date)"
+        }} 2>&1 | tee -a {log.out}
+        """
+
+
+# -----------------------------------------------------------------------------
+# Mapping
+# -----------------------------------------------------------------------------
+
+rule bwa_index:
+    input:
+        contigs=f"{OUTDIR}/assembly/{{cluster}}/final.contigs.fa",
+    output:
+        done=f"{OUTDIR}/assembly/{{cluster}}/bwa_index.done",
+    log:
+        out=f"{LOGDIR}/bwa_index/{{cluster}}.log",
+        time=f"{LOGDIR}/bwa_index/{{cluster}}.time.log",
+    benchmark:
+        f"{BENCHDIR}/bwa_index/{{cluster}}.benchmark.txt"
+    threads: 1
+    conda:
+        "envs/mapping.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            /usr/bin/time -v -o {log.time} bwa index {input.contigs}
+            touch {output.done}
+        }} 2>&1 | tee {log.out}
+        """
+
+
+# Every member sample is mapped to its own cluster's co-assembly
+rule bwa_mem:
+    input:
+        contigs=f"{OUTDIR}/assembly/{{cluster}}/final.contigs.fa",
+        index=f"{OUTDIR}/assembly/{{cluster}}/bwa_index.done",
+        r1=lambda wc: SAMPLES[wc.sample]["r1"],
+        r2=lambda wc: SAMPLES[wc.sample]["r2"],
+    output:
+        bam=temp(f"{OUTDIR}/bam/{{cluster}}/{{sample}}.sorted.bam"),
+        bai=temp(f"{OUTDIR}/bam/{{cluster}}/{{sample}}.sorted.bam.bai"),
+    log:
+        out=f"{LOGDIR}/bwa_mem/{{cluster}}.{{sample}}.log",
+        time=f"{LOGDIR}/bwa_mem/{{cluster}}.{{sample}}.time.log",
+    benchmark:
+        f"{BENCHDIR}/bwa_mem/{{cluster}}.{{sample}}.benchmark.txt"
+    threads: THREADS.get("bwa_mem", 16)
+    conda:
+        "envs/mapping.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            /usr/bin/time -v -o {log.time} bash -c "set -o pipefail; \
+                bwa mem -t {threads} {input.contigs} {input.r1} {input.r2} \
+                | samtools view -bS - \
+                | samtools sort -@ {threads} -o {output.bam} - \
+                && samtools index {output.bam} {output.bai}"
+        }} 2>&1 | tee {log.out}
+        """
+
+
+# -----------------------------------------------------------------------------
+# Binning and bin quality
+# -----------------------------------------------------------------------------
+
+# MetaBAT2 with default settings. A flag file records whether bins were made,
+# since a cluster can give no bins (e.g. a very shallow sample).
+rule metabat2:
+    input:
+        contigs=f"{OUTDIR}/assembly/{{cluster}}/final.contigs.fa",
+        bams=lambda wc: [f"{OUTDIR}/bam/{wc.cluster}/{s}.sorted.bam" for s in CLUSTERS[wc.cluster]],
+        bais=lambda wc: [f"{OUTDIR}/bam/{wc.cluster}/{s}.sorted.bam.bai" for s in CLUSTERS[wc.cluster]],
+    output:
+        depth=f"{OUTDIR}/bins/{{cluster}}/depth.txt",
+        flag=f"{OUTDIR}/bins/{{cluster}}/bins_exist.txt",
+    params:
+        bindir=lambda wc: f"{OUTDIR}/bins/{wc.cluster}",
+        extra=config.get("metabat2_extra", ""),
+    log:
+        out=f"{LOGDIR}/metabat2/{{cluster}}.log",
+        time=f"{LOGDIR}/metabat2/{{cluster}}.time.log",
+    benchmark:
+        f"{BENCHDIR}/metabat2/{{cluster}}.benchmark.txt"
+    threads: THREADS.get("metabat2", 20)
+    conda:
+        "envs/metabat2.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            /usr/bin/time -v -o {log.time} bash -c "set -e; \
+                jgi_summarize_bam_contig_depths --outputDepth {output.depth} {input.bams}; \
+                metabat2 -i {input.contigs} -a {output.depth} -o {params.bindir}/bin \
+                    -t {threads} {params.extra}"
+            if compgen -G "{params.bindir}/bin*.fa" > /dev/null; then
+                echo "HAS_BINS" > {output.flag}
+            else
+                echo "NO_BINS" > {output.flag}
+                echo "[INFO] No bins for {wildcards.cluster}"
+            fi
+        }} 2>&1 | tee {log.out}
+        """
+
+
+rule checkm2:
+    input:
+        flag=f"{OUTDIR}/bins/{{cluster}}/bins_exist.txt",
+    output:
+        report=f"{OUTDIR}/checkm2/{{cluster}}/quality_report.tsv",
+    params:
+        bindir=lambda wc: f"{OUTDIR}/bins/{wc.cluster}",
+        outdir=lambda wc: f"{OUTDIR}/checkm2/{wc.cluster}",
+        db=config["checkm2_db"],
+    log:
+        out=f"{LOGDIR}/checkm2/{{cluster}}.log",
+        time=f"{LOGDIR}/checkm2/{{cluster}}.time.log",
+    benchmark:
+        f"{BENCHDIR}/checkm2/{{cluster}}.benchmark.txt"
+    threads: THREADS.get("checkm2", 20)
+    resources:
+        mem_mb=MEM.get("checkm2", 50000),
+    conda:
+        "envs/checkm2.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            if grep -q "^NO_BINS$" {input.flag}; then
+                echo "[INFO] No bins for {wildcards.cluster}: CheckM2 skipped"
+                mkdir -p {params.outdir}
+                printf "Name\\tCompleteness\\tContamination\\n" > {output.report}
+            else
+                /usr/bin/time -v -o {log.time} checkm2 predict -x fa \
+                    -i {params.bindir} -o {params.outdir} \
+                    -t {threads} --database_path {params.db} --force
+            fi
+        }} 2>&1 | tee {log.out}
+        """
+
+
+# -----------------------------------------------------------------------------
+# Dereplication and taxonomy
+# -----------------------------------------------------------------------------
+
+# Symlinks every bin as <cluster>_<bin>.fa and writes dRep's genome list and
+# genome information (completeness, contamination from CheckM2).
+rule drep_input:
+    input:
+        reports=expand(f"{OUTDIR}/checkm2/{{cluster}}/quality_report.tsv", cluster=CLUSTER_NAMES),
+    output:
+        bin_list=f"{OUTDIR}/drep_input/bin_list.txt",
+        info=f"{OUTDIR}/drep_input/genome_info.csv",
+        quality=f"{OUTDIR}/drep_input/all_bins_quality.tsv",
+    params:
+        script=f"{workflow.basedir}/scripts/prepare_drep_input.py",
+        bins=f"{OUTDIR}/bins",
+        checkm=f"{OUTDIR}/checkm2",
+        linkdir=f"{OUTDIR}/drep_input/bins",
+        clusters=" ".join(CLUSTER_NAMES),
+    log:
+        f"{LOGDIR}/drep_input.log",
+    conda:
+        "envs/drep.yaml"
+    shell:
+        """
+        python {params.script} --bins {params.bins} --checkm {params.checkm} \
+            --linkdir {params.linkdir} --bin-list {output.bin_list} \
+            --info {output.info} --quality {output.quality} \
+            --clusters {params.clusters} 2>&1 | tee {log}
+        """
+
+
+rule drep:
+    input:
+        bin_list=f"{OUTDIR}/drep_input/bin_list.txt",
+        info=f"{OUTDIR}/drep_input/genome_info.csv",
+    output:
+        cdb=f"{OUTDIR}/drep/data_tables/Cdb.csv",
+        wdb=f"{OUTDIR}/drep/data_tables/Wdb.csv",
+        genomes=directory(f"{OUTDIR}/drep/dereplicated_genomes"),
+    params:
+        outdir=f"{OUTDIR}/drep",
+        comp=DREP.get("completeness", 50),
+        con=DREP.get("contamination", 10),
+        pa=DREP.get("primary_ani", 0.9),
+        sa=DREP.get("secondary_ani", 0.95),
+        extra=DREP.get("extra", ""),
+    log:
+        out=f"{LOGDIR}/drep.log",
+        time=f"{LOGDIR}/drep.time.log",
+    benchmark:
+        f"{BENCHDIR}/drep.benchmark.txt"
+    threads: THREADS.get("drep", 40)
+    conda:
+        "envs/drep.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            /usr/bin/time -v -o {log.time} dRep dereplicate {params.outdir} \
+                -g {input.bin_list} --genomeInfo {input.info} -p {threads} \
+                -comp {params.comp} -con {params.con} -pa {params.pa} -sa {params.sa} \
+                {params.extra}
+        }} 2>&1 | tee {log.out}
+        """
+
+
+rule gtdbtk:
+    input:
+        genomes=f"{OUTDIR}/drep/dereplicated_genomes",
+    output:
+        done=f"{OUTDIR}/gtdbtk/gtdbtk.done",
+    params:
+        outdir=f"{OUTDIR}/gtdbtk",
+        db=config["gtdbtk_db"],
+        extra=config.get("gtdbtk_extra", ""),
+    log:
+        out=f"{LOGDIR}/gtdbtk.log",
+        time=f"{LOGDIR}/gtdbtk.time.log",
+    benchmark:
+        f"{BENCHDIR}/gtdbtk.benchmark.txt"
+    threads: THREADS.get("gtdbtk", 64)
+    resources:
+        mem_mb=MEM.get("gtdbtk", 150000),
+    conda:
+        "envs/gtdbtk.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            export GTDBTK_DATA_PATH={params.db}
+            /usr/bin/time -v -o {log.time} gtdbtk classify_wf \
+                --genome_dir {input.genomes} -x fa \
+                --out_dir {params.outdir} --cpus {threads} {params.extra}
+            touch {output.done}
+        }} 2>&1 | tee {log.out}
+        """
+
+
+# -----------------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------------
+
+rule summary:
+    input:
+        quality=f"{OUTDIR}/drep_input/all_bins_quality.tsv",
+        cdb=f"{OUTDIR}/drep/data_tables/Cdb.csv",
+        wdb=f"{OUTDIR}/drep/data_tables/Wdb.csv",
+        gtdbtk=f"{OUTDIR}/gtdbtk/gtdbtk.done",
+    output:
+        genomes=f"{OUTDIR}/final/genomes.tsv",
+        summary=f"{OUTDIR}/final/summary.tsv",
+    params:
+        script=f"{workflow.basedir}/scripts/summarize_genomes.py",
+        gtdbtk_dir=f"{OUTDIR}/gtdbtk",
+        partition=config["partition"],
+    log:
+        f"{LOGDIR}/summary.log",
+    conda:
+        "envs/drep.yaml"
+    shell:
+        """
+        python {params.script} --quality {input.quality} --cdb {input.cdb} \
+            --wdb {input.wdb} --gtdbtk-dir {params.gtdbtk_dir} \
+            --partition {params.partition} \
+            --genomes-out {output.genomes} --summary-out {output.summary} 2>&1 | tee {log}
+        """

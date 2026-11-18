@@ -1,0 +1,263 @@
+# =============================================================================
+# Sample clustering for deep co-assembly
+#
+# Sketches trimmed paired-end reads with three k-mer distances
+#   mash               : Mash distance (k=31, s=10000, -m 2)
+#   sourmash           : 1 - Jaccard similarity (k=31, scaled=1000)
+#   sourmash_abundance : 1 - angular similarity of abundance sketches (k=31, scaled=1000)
+# and clusters each distance matrix with three algorithms
+#   KM     : k-medoids (PAM, BUILD init), k chosen by the elbow rule
+#   FKM    : fuzzy k-medoids (FCMdd, m=2, BUILD init), k chosen by the elbow rule
+#   DBSCAN : DBSCAN (min_samples=1), eps chosen by maximum silhouette
+#
+# Run:  snakemake -s Snakefile_clustering --configfile config/config_clustering.yaml \
+#           --use-conda --cores 16
+# =============================================================================
+
+import os
+import re
+
+
+configfile: "config/config_clustering.yaml"
+
+
+OUTDIR = config.get("outdir", "results").rstrip("/")
+LOGDIR = config.get("logdir", "logs").rstrip("/")
+BENCHDIR = config.get("benchmarkdir", "benchmarks").rstrip("/")
+
+METHODS = config.get("methods", ["mash", "sourmash", "sourmash_abundance"])
+ALGORITHMS = config.get("algorithms", ["KM", "FKM", "DBSCAN"])
+
+THREADS = config.get("threads", {})
+SKETCH = config.get("sketch", {})
+FKM_MODULE_DIR = config.get("fkm_module_dir", "external/fuzzy_k_medoids")
+
+
+include: "rules/common.smk"
+
+
+SAMPLES = read_sample_sheet(config["samples"])
+SAMPLE_NAMES = list(SAMPLES)
+
+if len(SAMPLE_NAMES) < 3:
+    raise ValueError("At least 3 samples are needed for clustering.")
+
+
+wildcard_constraints:
+    sample="|".join(re.escape(s) for s in SAMPLE_NAMES),
+    method="mash|sourmash|sourmash_abundance",
+    algorithm="KM|FKM|DBSCAN",
+
+
+def sketch_paths(method):
+    ext = "msh" if method == "mash" else "sig"
+    return [f"{OUTDIR}/{method}/sketches/{s}.{ext}" for s in SAMPLE_NAMES]
+
+
+# -----------------------------------------------------------------------------
+# Final target
+# -----------------------------------------------------------------------------
+
+rule all:
+    input:
+        expand(f"{OUTDIR}/{{method}}/{{algorithm}}_clusters.tsv",
+               method=METHODS, algorithm=ALGORITHMS),
+
+
+# -----------------------------------------------------------------------------
+# Sketching
+# -----------------------------------------------------------------------------
+
+# sourmash, with and without abundance tracking. r1 and r2 are sketched
+# separately and merged into one signature named after the sample.
+rule sketch_sourmash:
+    input:
+        r1=lambda wc: SAMPLES[wc.sample]["r1"],
+        r2=lambda wc: SAMPLES[wc.sample]["r2"],
+    output:
+        sig=f"{OUTDIR}/{{method}}/sketches/{{sample}}.sig",
+    wildcard_constraints:
+        method="sourmash|sourmash_abundance",
+    params:
+        k=SKETCH.get("sourmash_k", 31),
+        scaled=SKETCH.get("sourmash_scaled", 1000),
+        abund=lambda wc: ",abund" if wc.method == "sourmash_abundance" else "",
+        tmp1=lambda wc: f"{OUTDIR}/{wc.method}/sketches/{wc.sample}_r1.sig",
+        tmp2=lambda wc: f"{OUTDIR}/{wc.method}/sketches/{wc.sample}_r2.sig",
+    log:
+        out=f"{LOGDIR}/{{method}}/sketch.{{sample}}.log",
+        time1=f"{LOGDIR}/{{method}}/sketch.r1.{{sample}}.time.log",
+        time2=f"{LOGDIR}/{{method}}/sketch.r2.{{sample}}.time.log",
+        time3=f"{LOGDIR}/{{method}}/sketch.merge.{{sample}}.time.log",
+    benchmark:
+        f"{BENCHDIR}/{{method}}/sketch.{{sample}}.benchmark.txt"
+    threads: 1
+    conda:
+        "envs/clustering.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            echo "[START] $(date)"
+            /usr/bin/time -v -o {log.time1} sourmash sketch dna \
+                -p scaled={params.scaled},k={params.k}{params.abund} \
+                -o {params.tmp1} {input.r1}
+            /usr/bin/time -v -o {log.time2} sourmash sketch dna \
+                -p scaled={params.scaled},k={params.k}{params.abund} \
+                -o {params.tmp2} {input.r2}
+            /usr/bin/time -v -o {log.time3} sourmash sig merge \
+                {params.tmp1} {params.tmp2} -o {output.sig} --name {wildcards.sample}
+            rm -f {params.tmp1} {params.tmp2}
+            echo "[END] $(date)"
+        }} 2>&1 | tee {log.out}
+        """
+
+
+# mash: r1 and r2 are concatenated into a temporary file named after the
+# sample, so the sample name appears in the mash dist output.
+rule sketch_mash:
+    input:
+        r1=lambda wc: SAMPLES[wc.sample]["r1"],
+        r2=lambda wc: SAMPLES[wc.sample]["r2"],
+    output:
+        msh=f"{OUTDIR}/mash/sketches/{{sample}}.msh",
+    params:
+        k=SKETCH.get("mash_k", 31),
+        size=SKETCH.get("mash_sketch_size", 10000),
+        min_copies=SKETCH.get("mash_min_copies", 2),
+        prefix=lambda wc: f"{OUTDIR}/mash/sketches/{wc.sample}",
+        tmp=lambda wc: f"{OUTDIR}/mash/sketches/{wc.sample}.fq.gz",
+    log:
+        out=f"{LOGDIR}/mash/sketch.{{sample}}.log",
+        time1=f"{LOGDIR}/mash/cat.{{sample}}.time.log",
+        time2=f"{LOGDIR}/mash/sketch.{{sample}}.time.log",
+    benchmark:
+        f"{BENCHDIR}/mash/sketch.{{sample}}.benchmark.txt"
+    threads: 1
+    conda:
+        "envs/clustering.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            echo "[START] $(date)"
+            /usr/bin/time -v -o {log.time1} cat {input.r1} {input.r2} > {params.tmp}
+            /usr/bin/time -v -o {log.time2} mash sketch \
+                -k {params.k} -s {params.size} -m {params.min_copies} -r \
+                -o {params.prefix} {params.tmp}
+            rm -f {params.tmp}
+            echo "[END] $(date)"
+        }} 2>&1 | tee {log.out}
+        """
+
+
+# -----------------------------------------------------------------------------
+# Distance matrices (square TSV, first column and header = sample names)
+# -----------------------------------------------------------------------------
+
+rule distance_sourmash:
+    input:
+        sketches=lambda wc: sketch_paths(wc.method),
+    output:
+        npy=f"{OUTDIR}/{{method}}/sourmash_comparison_matrix.npy",
+        labels=f"{OUTDIR}/{{method}}/sourmash_comparison_matrix.npy.labels.txt",
+        tsv=f"{OUTDIR}/{{method}}/distance_matrix.tsv",
+    wildcard_constraints:
+        method="sourmash|sourmash_abundance",
+    params:
+        k=SKETCH.get("sourmash_k", 31),
+        script=f"{workflow.basedir}/scripts/sourmash_npy_to_tsv.py",
+    log:
+        out=f"{LOGDIR}/{{method}}/distance.log",
+        time1=f"{LOGDIR}/{{method}}/distance.compare.time.log",
+        time2=f"{LOGDIR}/{{method}}/distance.convert.time.log",
+    benchmark:
+        f"{BENCHDIR}/{{method}}/distance.benchmark.txt"
+    threads: THREADS.get("distance", 8)
+    conda:
+        "envs/clustering.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            echo "[START] $(date)"
+            /usr/bin/time -v -o {log.time1} sourmash compare -k {params.k} \
+                -p {threads} -o {output.npy} {input.sketches}
+            /usr/bin/time -v -o {log.time2} python {params.script} {output.npy} {output.tsv}
+            echo "[END] $(date)"
+        }} 2>&1 | tee {log.out}
+        """
+
+
+rule distance_mash:
+    input:
+        sketches=sketch_paths("mash"),
+    output:
+        msh=f"{OUTDIR}/mash/all_samples.msh",
+        tab=f"{OUTDIR}/mash/mash_distances.tab",
+        tsv=f"{OUTDIR}/mash/distance_matrix.tsv",
+    params:
+        prefix=f"{OUTDIR}/mash/all_samples",
+        script=f"{workflow.basedir}/scripts/mash_dist_to_matrix.py",
+    log:
+        out=f"{LOGDIR}/mash/distance.log",
+        time1=f"{LOGDIR}/mash/distance.paste.time.log",
+        time2=f"{LOGDIR}/mash/distance.dist.time.log",
+        time3=f"{LOGDIR}/mash/distance.convert.time.log",
+    benchmark:
+        f"{BENCHDIR}/mash/distance.benchmark.txt"
+    threads: THREADS.get("distance", 8)
+    conda:
+        "envs/clustering.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            echo "[START] $(date)"
+            rm -f {output.msh}
+            /usr/bin/time -v -o {log.time1} mash paste {params.prefix} {input.sketches}
+            /usr/bin/time -v -o {log.time2} mash dist -p {threads} \
+                {output.msh} {output.msh} > {output.tab}
+            /usr/bin/time -v -o {log.time3} python {params.script} {output.tab} {output.tsv}
+            echo "[END] $(date)"
+        }} 2>&1 | tee {log.out}
+        """
+
+
+# -----------------------------------------------------------------------------
+# Clustering
+# Output per method and algorithm: {algorithm}_clusters.tsv with columns
+#   sample  cluster      (cluster ids start at 1)
+# plus a tuning plot (elbow or silhouette) and a UMAP plot of the clusters.
+# -----------------------------------------------------------------------------
+
+rule cluster:
+    input:
+        f"{OUTDIR}/{{method}}/distance_matrix.tsv",
+    output:
+        tsv=f"{OUTDIR}/{{method}}/{{algorithm}}_clusters.tsv",
+        tuning=f"{OUTDIR}/{{method}}/{{algorithm}}_tuning_plot.png",
+        plot=f"{OUTDIR}/{{method}}/{{algorithm}}_clustering_plot.png",
+    params:
+        script=lambda wc: f"{workflow.basedir}/scripts/cluster_{wc.algorithm}.py",
+        # fuzzy_k_medoids_algorithm.py lives in its own repository
+        pythonpath=lambda wc: os.path.abspath(FKM_MODULE_DIR),
+    log:
+        out=f"{LOGDIR}/{{method}}/cluster.{{algorithm}}.log",
+        time=f"{LOGDIR}/{{method}}/cluster.{{algorithm}}.time.log",
+    benchmark:
+        f"{BENCHDIR}/{{method}}/cluster.{{algorithm}}.benchmark.txt"
+    threads: THREADS.get("cluster", 1)
+    conda:
+        "envs/clustering.yaml"
+    shell:
+        """
+        set -euo pipefail
+        {{
+            echo "[START] $(date)"
+            export PYTHONPATH="{params.pythonpath}:${{PYTHONPATH:-}}"
+            /usr/bin/time -v -o {log.time} python {params.script} \
+                {input} {output.tsv} {output.tuning} {output.plot}
+            echo "[END] $(date)"
+        }} 2>&1 | tee {log.out}
+        """

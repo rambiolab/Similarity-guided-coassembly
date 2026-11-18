@@ -1,0 +1,3 @@
+[submodule "external/fuzzy_k_medoids"]
+	path = external/fuzzy_k_medoids
+	url = https://github.com/rambiolab/Fuzzy-K-Medoids

@@ -1,0 +1,7 @@
+sample	read	path
+sampleA	r1	/path/to/reads/sampleA_1.fastq.gz
+sampleA	r2	/path/to/reads/sampleA_2.fastq.gz
+sampleB	r1	/path/to/reads/sampleB_1.fastq.gz
+sampleB	r2	/path/to/reads/sampleB_2.fastq.gz
+sampleC	r1	/path/to/reads/sampleC_1.fastq.gz
+sampleC	r2	/path/to/reads/sampleC_2.fastq.gz

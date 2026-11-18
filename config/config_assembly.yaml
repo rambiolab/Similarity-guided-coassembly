@@ -1,0 +1,46 @@
+# Sample sheet: the same file as for the clustering workflow
+samples: config/samples_example.tsv
+
+# One partition from the clustering workflow (columns sample, cluster)
+partition: results/sourmash/FKM_clusters.tsv
+
+# All output of this run goes here; use one folder per partition
+outdir: results/coassembly/sourmash_FKM
+
+# Clusters are named <cluster_prefix><cluster id>, e.g. cluster_1
+cluster_prefix: cluster_
+
+# Databases
+checkm2_db: /path/to/checkm2/uniref100.KO.1.dmnd
+gtdbtk_db: /path/to/gtdbtk/release232
+
+threads:
+  megahit: 32
+  bwa_mem: 16
+  metabat2: 20
+  checkm2: 20
+  drep: 40
+  gtdbtk: 64
+
+# Memory per job (MB). MEGAHIT uses megahit_memory_fraction of mem_mb as its
+# --memory cap. Peak RAM grows with the input size of a cluster: in the
+# manuscript's sewage data roughly 3.5 GB x (input GB)^0.885, up to ~520 GB.
+mem_mb:
+  megahit: 600000
+  checkm2: 50000
+  gtdbtk: 150000
+megahit_memory_fraction: 0.9
+
+# Extra command-line options (empty = tool defaults, as in the manuscript)
+megahit_extra: ""
+metabat2_extra: ""
+gtdbtk_extra: ""
+
+# dRep: bins with >= 50% completeness and <= 10% contamination,
+# species = 95% ANI
+drep:
+  completeness: 50
+  contamination: 10
+  primary_ani: 0.9
+  secondary_ani: 0.95
+  extra: ""
