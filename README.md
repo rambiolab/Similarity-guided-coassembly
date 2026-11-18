@@ -130,8 +130,3 @@ HQ: ≥ 90% completeness and < 5% contamination; MQ: ≥ 50% and < 10%. A specie
 is novel when GTDB-Tk gives it no species name.
 
 BAM files are deleted once the cluster is binned (`temp`).
-
-## Data
-
-The manuscript applies the workflow to, among others, the VEO sewage dataset
-(ENA PRJEB68319; Becsei et al. 2024, *Nat Commun* 15:7551).
