@@ -130,3 +130,146 @@ HQ: ≥ 90% completeness and < 5% contamination; MQ: ≥ 50% and < 10%. A specie
 is novel when GTDB-Tk gives it no species name.
 
 BAM files are deleted once the cluster is binned (`temp`).
+
+
+# Analysis scripts
+
+Post-hoc analyses of the partitions and co-assemblies, as used for the manuscript.
+They run outside Snakemake and need only numpy and scikit-learn; the clustering
+environment has both:
+
+```bash
+conda env create -f envs/clustering.yaml -n coassembly-clustering
+conda activate coassembly-clustering
+```
+
+| script | what it does |
+|---|---|
+| `cluster_agreement.py` | AMI of each partition vs metadata labels (site, city, season, …) with permutation nulls, and AMI between partitions |
+| `season_split_search.py` | best split of the calendar year into 2–4 periods vs the partitions, with a null that repeats the search on shuffled dates |
+| `assembly_cost_correction.py` | replaces the CPU hours of resumed MEGAHIT runs by a log-log fit on input size; totals per partition |
+| `cpu_per_species.py` | CPU hours per recovered species for one partition (optionally a subset of samples, e.g. one city), with a bootstrap over clusters, and against a reference approach |
+| `common.py` | shared input handling (partitions, metadata, subsets, replicas) |
+
+## Inputs
+
+**Partitions**, in either form (both can be combined):
+
+- `--partition NAME=PATH`: the workflow's `results/{method}/{algorithm}_clusters.tsv`
+  (columns `sample`, `cluster`). Repeat for several partitions, e.g.
+  `--partition s_fkm=results/sourmash/FKM_clusters.tsv`.
+- `--cluster_summary PATH`: one table of all clusters (columns `cluster_name`,
+  `samples` comma-separated, `found_in` labels such as `sourmash:FKM`, several
+  separated by `;`). Labels are renamed to short names (`sourmash:FKM` → `s_fkm`,
+  `sourmash_abundance:KM` → `sa_km`, …; see `common.py`).
+
+**Metadata**: a TSV with one row per sample (sequencing run) and the label columns.
+Useful options:
+
+- `--id_col` (default `run_accession`): column matching the partition sample names
+- `--derive city=site:_:0`: build a column from part of another (`Copenhagen_RA` → `Copenhagen`)
+- `--subset city=Copenhagen`: keep only those samples
+- `--collapse_by ENA_ALIAS --replica_col REPLICA`: one run per physical sample (lowest replica)
+
+## `cluster_agreement.py`
+
+AMI (adjusted mutual information; Vinh, Epps & Bailey 2010, *JMLR* 11:2837–2854) is
+chance-corrected: 0 for random agreement, 1 for identical partitions. It suits
+unbalanced references and many small clusters better than ARI (Romano et al. 2016,
+*JMLR* 17(134)).
+
+Significance comes from permutation nulls that keep the partition fixed and shuffle
+the labels (`--n_perm`, default 1,000, seed 1):
+
+- `global`: labels shuffled across all samples. Does the partition follow the label at all?
+- `within_<COL>` (from `--within LABEL=COL`): labels shuffled within each value of COL.
+  For season within site: does the partition follow season beyond what site explains?
+
+```bash
+# all runs
+python analysis/cluster_agreement.py --cluster_summary cluster_summary.tsv \
+    --metadata VEO_sites.tsv --derive city=site:_:0 \
+    --labels site city Season --within Season=site --outdir agreement/all_runs
+
+# Copenhagen only
+python analysis/cluster_agreement.py --cluster_summary cluster_summary.tsv \
+    --metadata VEO_sites.tsv --derive city=site:_:0 --subset city=Copenhagen \
+    --labels site Season --within Season=site --outdir agreement/Copenhagen_runs
+```
+
+Add `--collapse_by ENA_ALIAS` for one run per physical sample.
+
+Output: `agreement.tsv` (partition, label, null, AMI, null mean, z, p),
+`partition_vs_partition.tsv` (AMI between all pairs of partitions), and
+`samples_used.txt`.
+
+## `assembly_cost_correction.py`
+
+Input: a per-cluster table with `cluster`, `input_gb`, `cpu_h`, `peak_ram_gb`,
+`resumed` (True/False), and optionally `methods` (comma-separated partitions containing
+the cluster). An assembly resumed with `megahit --continue` may have a time log that
+covers only the resumed part. Those clusters get the CPU hours predicted by a fit on all
+non-resumed clusters with at least `--min_gb` input:
+
+    log(cpu_h) = a + b · log(input_gb)
+
+`Snakefile_assembly` appends the time log on a restart (`/usr/bin/time -a`), so newer
+runs keep both attempts; check that the table is built from all blocks of the log.
+
+```bash
+python analysis/assembly_cost_correction.py --resources assembly_resources.per_cluster.tsv \
+    --outdir cost
+```
+
+Output: `resources_corrected.tsv` (adds `cpu_h_fit`, its ±1 residual-SD range,
+`cpu_h_corrected`, `corrected`), `fit.tsv`, and `totals.tsv` (measured and corrected
+CPU hours and largest-job peak RAM per partition).
+
+## `cpu_per_species.py`
+
+CPU hours per recovered species for one partition. Species are dRep secondary clusters
+(95% ANI). A species counts for a set of assemblies if any of their bins falls in it,
+using all bins from the partition's own `Cdb.csv` (not only the dereplicated winners,
+which would undercount).
+
+- Without `--combined`: species are the partition's own dRep clusters.
+- With `--combined` (a dRep run over several approaches together): species are counted
+  on the combined clusters, so the partition and a reference approach (`--ref_cdb`,
+  e.g. per-site co-assembly) use one species definition. Own species are mapped to the
+  combined table through their winner genome (`--wdb`; for the reference, the winner is
+  taken to be the member present in the combined table if no `--ref_wdb` is given).
+- `--subset COL=VALUE` restricts to clusters whose samples all match; `--mixed`
+  (`fail`, `exclude`, `include`, `majority`) handles clusters that match only partly.
+- Uncertainty: bootstrap over the partition's clusters (`--n_boot`, default 2,000);
+  for the reference, the cost range from `--ref_cost` (columns `cpu_h`, `cpu_h_low`,
+  `cpu_h_high`, `peak_ram_gb`).
+
+Genome names are `<prefix><cluster>_bin.N.fa` (`scripts/prepare_drep_input.py` writes
+`<cluster>_bin.N.fa`); give the prefix with `--genome_prefix` / `--ref_prefix`. For
+partitions from `Snakefile_clustering` (cluster ids 1, 2, …), add `--cluster_prefix cluster_`.
+
+```bash
+# whole partition, own species
+python analysis/cpu_per_species.py --partition s_fkm=results/sourmash/FKM_clusters.tsv \
+    --cluster_prefix cluster_ --method s_fkm --metadata samples_meta.tsv \
+    --resources cost/resources_corrected.tsv \
+    --cdb out_s_fkm/drep/data_tables/Cdb.csv --wdb out_s_fkm/drep/data_tables/Wdb.csv \
+    --outdir cpu_per_species/s_fkm
+
+# Copenhagen, s_fkm vs per-site co-assembly on the combined species
+python analysis/cpu_per_species.py --cluster_summary cluster_summary.tsv --method s_fkm \
+    --metadata VEO_sites.tsv --derive city=site:_:0 --subset city=Copenhagen \
+    --resources cost/resources_corrected.tsv \
+    --cdb s_fkm/Cdb.csv --wdb s_fkm/Wdb.csv --genome_prefix s_fkm_ \
+    --combined combined/Cdb.csv \
+    --ref_name per-site --ref_cdb paper_site/Cdb.csv --ref_prefix paper_site_ \
+    --ref_groups site_Copenhagen_RA site_Copenhagen_RD site_Copenhagen_RL \
+    --ref_cost site_assembly_prediction.tsv --ref_cost_id site --ref_cost_strip site_ \
+    --outdir cpu_per_species/Copenhagen_s_fkm
+```
+
+Output: `summary.tsv` (assemblies, CPU hours, largest-job peak RAM, species, CPU hours
+per species with range), `overlap.tsv` (species counts and overlaps), and
+`clusters.tsv` (per cluster: samples, input, CPU hours, peak RAM, species, species found
+in no other cluster of the partition).
+
